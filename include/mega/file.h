@@ -330,6 +330,19 @@ struct DelayedSyncUpload
     {}
 };
 
+/**
+ * @brief Finds a suitable node that can be cloned for a user-initiated upload.
+ *
+ * This function searches for a node in the cloud that matches the File's fingerprint
+ * and MAC. It returns a pointer to a valid clone node if found, or nullptr if no
+ * suitable node exists.
+ *
+ * A valid node to be cloned is a matched node that also has a valid key (no zero-key issue).
+ *
+ * @param mc Reference to the MegaClient.
+ * @param file Const reference to the File being uploaded.
+ * @return Pointer to a valid clone node if found, or nullptr otherwise.
+ */
 Node* findCloneFileCandidate(MegaClient& mc, const File& file);
 
 } // namespace mega

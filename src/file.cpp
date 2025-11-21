@@ -374,7 +374,7 @@ void File::completed(Transfer* t, putsource_t source)
         if (auto cloneNode = findCloneFileCandidate(*t->client, *this); cloneNode)
         {
             const auto displayPath = cloneNode->displaypath();
-            LOG_debug << "Cloning node rather than sync uploading: " << displayPath << " for " << name;
+            LOG_debug << "Cloning node rather than uploading: " << displayPath << " for " << name;
             t->client->sendevent(99485, "Cloning node for upload");
             sendPutnodesToCloneNode(t->client,
                                       cloneNode,
@@ -977,7 +977,7 @@ bool SyncDownload_inClient::failed(error e, MegaClient* mc)
 struct FindNodeByFilePredicate
 {
     /**
-     * @brief Reference to the MegaClient managing the synchronization process.
+     * @brief Reference to the MegaClient managing the upload process.
      */
     MegaClient& mClient;
 
@@ -997,7 +997,7 @@ struct FindNodeByFilePredicate
     /**
      * @brief Constructs a FindNodeByFilePredicate instance.
      *
-     * @param client Reference to the MegaClient managing synchronization.
+     * @param client Reference to the MegaClient managing the upload process.
      * @param file Const reference to the File being processed.
      */
     FindNodeByFilePredicate(MegaClient& client, const File& file)
@@ -1064,4 +1064,4 @@ Node* findCloneFileCandidate(MegaClient& mc, const File& file)
 
     return nullptr;
 }
-} // namespace
+} // namespace mega
