@@ -2097,6 +2097,11 @@ void MegaClient::initScStreaming()
                                // Allow any pending command completions.
                                sc_checkSequenceTag(string());
                            }
+                           else
+                           {
+                               LOG_warn << "SC streaming: failed to parse sequence number "
+                                           "(incomplete or malformed data)";
+                           }
                            return true;
                        });
 
@@ -2144,7 +2149,7 @@ void MegaClient::initScStreaming()
                            LOG_debug << "SC streaming: server scalar '" << err << "'";
                            return true;
                        });
-    mScStreamingActive = true;
+    mScStreamingActive = false;
     mScStreamingConsumedAny = false;
     mScStreamingFinished = false;
 }
@@ -3707,13 +3712,15 @@ void MegaClient::exec()
 
         if (!scpaused && jsonsc.pos)
         {
-            if (mScStreamingActive && mScStreamingConsumedAny && mScStreamingFinished)
+            if (mScStreamingActive && mScStreamingFinished)
             {
                 // mark done so new request can start
                 jsonsc.pos = nullptr;
                 pendingsc.reset();
                 btsc.reset();
                 mScStreamingActive = false;
+                mScStreamingConsumedAny = false;
+                mScStreamingFinished = false;
             }
             else
             {
@@ -3792,6 +3799,7 @@ void MegaClient::exec()
                 // Enable incremental streaming of action packets
                 pendingsc->mChunked = true;
                 mScStreamingActive = true;
+                mScJsonSplitter.clear();
                 pendingsc->post(this);
                 app->notify_network_activity(NetworkActivityChannel::SC,
                                              NetworkActivityType::REQUEST_SENT,
