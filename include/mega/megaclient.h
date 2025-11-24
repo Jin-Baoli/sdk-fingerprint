@@ -557,6 +557,12 @@ public:
 private:
     // Pro Flexi plan is enabled
     bool mProFlexi = false;
+
+    // filters for JSON parsing in streaming
+    std::map<std::string, std::function<bool(JSON*)>> mScFilters;
+
+    JSONSplitter mScJsonSplitter;
+
 public:
     bool isProFlexi() const { return mProFlexi; }
 
@@ -1896,6 +1902,8 @@ public:
     void sc_cce();
 
     void init();
+    void initScStreaming();
+    void processSingleScActionPacket(const char*, size_t);
 
     // remove caches
     void removeCaches();
@@ -2109,6 +2117,10 @@ public:
     JSON jsonsc;
     bool insca;
     bool insca_notlast;
+
+    bool mScStreamingActive = false;
+    bool mScStreamingConsumedAny = false;
+    bool mScStreamingFinished = false;
 
     // no two interrelated client instances should ever have the same sessionid
     char sessionid[10];
