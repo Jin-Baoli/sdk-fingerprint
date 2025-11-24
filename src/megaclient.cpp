@@ -1862,6 +1862,298 @@ sharedNode_vector MegaClient::childnodesbyname(Node* p, const char* name, bool s
     return found;
 }
 
+// ---- SC Streaming helpers (logical client-side chunking) ----
+// Process one complete action packet object extracted by splitter.
+void MegaClient::processSingleScActionPacket(const char* data, size_t len)
+{
+    mScStreamingConsumedAny = true;
+    std::unique_lock<recursive_mutex> lock(nodeTreeMutex);
+
+    if (!data || !len)
+        return;
+
+    JSON local;
+    local.begin(data);
+    if (!local.enterobject())
+    {
+        LOG_warn << "SC streaming: malformed actionpacket fragment";
+        return;
+    }
+
+    // Swap in the packet parser context temporarily.
+    JSON saved = jsonsc;
+    jsonsc = local;
+
+    // Evaluate sequence tag gating (scan for "st" without side effects first).
+    {
+        JSON scan = local;
+        nameid id;
+        string stvalue;
+        while ((id = scan.getnameid()) != EOO)
+        {
+            if (id == makeNameid("st"))
+            {
+                scan.storeobject(&stvalue);
+                break;
+            }
+            else
+            {
+                scan.storeobject(); // skip
+            }
+        }
+        if (!stvalue.empty() && !sc_checkSequenceTag(stvalue))
+        {
+            // Command response not yet available – defer (leave packet for full parse later).
+            jsonsc = saved;
+            return;
+        }
+        if (stvalue.empty())
+        {
+            sc_checkSequenceTag(string()); // allow pending command completions if appropriate
+        }
+    }
+
+    // Parse & dispatch this single action packet using existing handlers.
+    if (jsonsc.getnameid() == makeNameid("a"))
+    {
+        nameid action = jsonsc.getnameidvalue();
+
+        // Skip optional self-origin marker "i"
+        if (jsonsc.getnameid() == makeNameid("i"))
+        {
+            jsonsc.storeobject();
+        }
+
+        switch (action)
+        {
+            case name_id::u:
+                sc_updatenode();
+                break;
+            case makeNameid("t"):
+            {
+                bool isMove = false;
+                handle originatingUser = sc_newnodes(nullptr, isMove);
+                mergenewshares(true);
+                (void)originatingUser;
+                break;
+            }
+            case name_id::d:
+                sc_deltree();
+                break;
+            case makeNameid("s"):
+            case makeNameid("s2"):
+                if (sc_shares())
+                {
+                    mergenewshares(true);
+                }
+                break;
+            case name_id::c:
+                sc_contacts();
+                break;
+            case makeNameid("fa"):
+                sc_fileattr();
+                break;
+            case makeNameid("ua"):
+                sc_userattr();
+                break;
+            case name_id::psts:
+            case name_id::psts_v2:
+            case makeNameid("ftr"):
+                if (sc_upgrade(action))
+                {
+                    app->account_updated();
+                    abortbackoff(true);
+                }
+                break;
+            case makeNameid("pses"):
+                sc_paymentreminder();
+                break;
+            case makeNameid("ipc"):
+                sc_ipc();
+                break;
+            case makeNameid("opc"):
+                sc_opc();
+                break;
+            case name_id::upci:
+                sc_upc(true);
+                break;
+            case name_id::upco:
+                sc_upc(false);
+                break;
+            case makeNameid("ph"):
+                sc_ph();
+                break;
+            case makeNameid("se"):
+                sc_se();
+                break;
+            case makeNameid("uac"):
+                sc_uac();
+                break;
+            case makeNameid("la"):
+                sc_la();
+                break;
+            case makeNameid("ub"):
+                sc_ub();
+                break;
+            case makeNameid("sqac"):
+                sc_sqac();
+                break;
+            case makeNameid("asp"):
+                sc_asp();
+                break;
+            case makeNameid("ass"):
+                sc_ass();
+                break;
+            case makeNameid("asr"):
+                sc_asr();
+                break;
+            case makeNameid("aep"):
+                sc_aep();
+                break;
+            case makeNameid("aer"):
+                sc_aer();
+                break;
+            case makeNameid("pk"):
+                sc_pk();
+                break;
+            case makeNameid("uec"):
+                sc_uec();
+                break;
+            case makeNameid("cce"):
+                sc_cce();
+                break;
+#ifdef ENABLE_CHAT
+            case makeNameid("mcc"):
+            case makeNameid("mcpc"):
+                sc_chatupdate(action == makeNameid("mcpc"));
+                break;
+            case makeNameid("mcfpc"):
+            case makeNameid("mcfc"):
+                sc_chatflags();
+                break;
+            case makeNameid("mcpna"):
+            case makeNameid("mcna"):
+                sc_chatnode();
+                break;
+            case name_id::mcsmp:
+                sc_scheduledmeetings();
+                break;
+            case name_id::mcsmr:
+                sc_delscheduledmeeting();
+                break;
+#endif
+            default:
+                LOG_debug << "SC streaming: unknown action '" << action << "' ignored";
+                break;
+        }
+    }
+    else
+    {
+        LOG_warn << "SC streaming: packet missing action discriminator";
+    }
+
+    // Restore original parser.
+    jsonsc = saved;
+}
+
+// Initialize streaming filters for Server→Client (SC) actionpacket processing
+// using logical (client-side) chunk boundaries.
+// This replaces earlier synthetically injected markers and unsafe per-object parsing.
+void MegaClient::initScStreaming()
+{
+    mScFilters.clear();
+
+    // Start of action packet array: {"a":[
+    mScFilters.emplace("{\"a\":[",
+                       [this](JSON*)
+                       {
+                           // No-op: splitter just acknowledges start of packets array.
+                           return true;
+                       });
+
+    // Individual action packet object start: {"a":"<type>"
+    // JSONSplitter supplies a complete object to storeobject().
+    mScFilters.emplace("{\"a\":\"",
+                       [this](JSON* json)
+                       {
+                           std::string packet;
+                           if (!json->storeobject(&packet))
+                           {
+                               LOG_warn << "SC streaming: malformed actionpacket object";
+                               return false; // abort splitter
+                           }
+                           processSingleScActionPacket(packet.c_str(), packet.size());
+                           return true;
+                       });
+
+    // Sequence number: {"sn"
+    mScFilters.emplace("{\"sn",
+                       [this](JSON* json)
+                       {
+                           handle h;
+                           if (json->storebinary((byte*)&h, sizeof h) == sizeof h)
+                           {
+                               scsn.setScsn(h);
+                               // Allow any pending command completions.
+                               sc_checkSequenceTag(string());
+                           }
+                           else
+                           {
+                               LOG_warn << "SC streaming: failed to parse sequence number "
+                                           "(incomplete or malformed data)";
+                           }
+                           return true;
+                       });
+
+    // Notify URL: {"w"
+    mScFilters.emplace("{\"w",
+                       [this](JSON* json)
+                       {
+                           json->storeobject(&scnotifyurl);
+                           return true;
+                       });
+
+    // End of packets array: ]
+    mScFilters.emplace("]",
+                       [this](JSON*)
+                       {
+                           // Wait for sequence number before finalization.
+                           return true;
+                       });
+
+    // Root object end: }
+    mScFilters.emplace("}",
+                       [this](JSON*)
+                       {
+                           mScStreamingFinished = true;
+                           // Completion tick: normal procsc() path will finalize if needed.
+                           return true;
+                       });
+
+    // Generic object (other root-level objects that may appear – consume safely).
+    mScFilters.emplace("{",
+                       [this](JSON* json)
+                       {
+                           std::string discard;
+                           json->storeobject(&discard);
+                           return true;
+                       });
+
+    // Numeric error / keep-alive (e.g. "-3", "-4", "-15")
+    mScFilters.emplace("-",
+                       [this](JSON* json)
+                       {
+                           // Consume scalar to advance.
+                           std::string err;
+                           json->storeobject(&err);
+                           LOG_debug << "SC streaming: server scalar '" << err << "'";
+                           return true;
+                       });
+    mScStreamingActive = false;
+    mScStreamingConsumedAny = false;
+    mScStreamingFinished = false;
+}
+
 void MegaClient::init()
 {
     warned = false;
@@ -1922,6 +2214,9 @@ void MegaClient::init()
 
     // Reset last known capacity.
     mLastKnownCapacity = -1;
+
+    // Initialize streaming filters for server-client action packets
+    initScStreaming();
 }
 
 MegaClient::MegaClient(MegaApp* a,
@@ -3249,6 +3544,9 @@ void MegaClient::exec()
                     insca_notlast = false;
                     jsonsc.begin(pendingsc->in.c_str());
                     jsonsc.enterobject();
+
+
+
                     app->notify_network_activity(NetworkActivityChannel::SC,
                                                  NetworkActivityType::REQUEST_RECEIVED,
                                                  API_OK);
@@ -3393,27 +3691,53 @@ void MegaClient::exec()
                     pendingsc.reset();
                     btsc.reset();
                 }
+                // REQ_INFLIGHT (SC)
+                else if (pendingsc->mChunked && (pendingsc->bufpos > pendingsc->notifiedbufpos))
+                {
+                    const char* chunk = pendingsc->data(); // raw buffer
+                    size_t consumed = mScJsonSplitter.processChunk(&mScFilters, chunk);
+                    if (consumed)
+                    {
+                        // shift remaining bytes down (or add an API to purge like for cs)
+                        pendingsc->purge(consumed); // if purge handles buf; otherwise implement
+                        notifypurge();
+                    }
+                }
                 break;
             default:
                 break;
             }
+
         }
 
         if (!scpaused && jsonsc.pos)
         {
-            // FIXME: reload in case of bad JSON
-            if (procsc())
+            if (mScStreamingActive && mScStreamingFinished)
             {
-                // completed - initiate next SC request
+                // mark done so new request can start
                 jsonsc.pos = nullptr;
                 pendingsc.reset();
                 btsc.reset();
-
-                // upon reception of action packets, if the cs request is waiting for a retry
-                // and it failed due to -3 or -4 error from API, we can abort the backoff
-                if (reqs.retryReasonIsApi())
+                mScStreamingActive = false;
+                mScStreamingConsumedAny = false;
+                mScStreamingFinished = false;
+            }
+            else
+            {
+                // FIXME: reload in case of bad JSON
+                if (procsc())
                 {
-                    btcs.reset();
+                    // completed - initiate next SC request
+                    jsonsc.pos = nullptr;
+                    pendingsc.reset();
+                    btsc.reset();
+
+                    // upon reception of action packets, if the cs request is waiting for a retry
+                    // and it failed due to -3 or -4 error from API, we can abort the backoff
+                    if (reqs.retryReasonIsApi())
+                    {
+                        btcs.reset();
+                    }
                 }
             }
         }
@@ -3472,6 +3796,10 @@ void MegaClient::exec()
                 }
 
                 pendingsc->type = REQ_JSON;
+                // Enable incremental streaming of action packets
+                pendingsc->mChunked = true;
+                mScStreamingActive = true;
+                mScJsonSplitter.clear();
                 pendingsc->post(this);
                 app->notify_network_activity(NetworkActivityChannel::SC,
                                              NetworkActivityType::REQUEST_SENT,
